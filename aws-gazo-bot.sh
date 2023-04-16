@@ -33,7 +33,7 @@ readonly AGB_IS_LINUX AGB_IS_OPENBSD
 
 create_ami() {
 	local _arch=${ARCH} _bucket_conf _importsnapid _snap
-	local _region=$(abg_aws configure get region)
+	local _region=$(agb_aws configure get region)
 
 	[[ ${_region} == us-east-1 ]] ||
 		_bucket_conf="--create-bucket-configuration LocationConstraint=${_region}"
@@ -44,8 +44,8 @@ create_ami() {
 	vmdktool -v ${IMGPATH}.vmdk ${IMGPATH}
 
 	agb_log "uploading image to S3"
-	abg_aws s3api create-bucket --bucket ${_BUCKETNAME} ${_bucket_conf}
-	abg_aws s3 cp ${IMGPATH}.vmdk s3://${_BUCKETNAME}
+	agb_aws s3api create-bucket --bucket ${_BUCKETNAME} ${_bucket_conf}
+	agb_aws s3 cp ${IMGPATH}.vmdk s3://${_BUCKETNAME}
 
 	agb_log "converting VMDK to snapshot"
 	cat <<-EOF >>${_WRKDIR}/containers.json
@@ -60,15 +60,15 @@ create_ami() {
 	EOF
 
 	# Cannot use import-image: "ClientError: Unknown OS / Missing OS files."
-	#abg_aws ec2 import-image --description "${DESCR}" --disk-containers \
+	#agb_aws ec2 import-image --description "${DESCR}" --disk-containers \
 	#	file://"${_WRKDIR}/containers.json"
 
-	_importsnapid=$(abg_aws ec2 import-snapshot --description "${DESCR}" \
+	_importsnapid=$(agb_aws ec2 import-snapshot --description "${DESCR}" \
 		--disk-container file://"${_WRKDIR}/containers.json" \
 		--role-name ${_IMGNAME} --query "ImportTaskId" --output text)
 
 	while true; do
-		set -A _snap -- $(abg_aws ec2 describe-import-snapshot-tasks \
+		set -A _snap -- $(agb_aws ec2 describe-import-snapshot-tasks \
 			--output text --import-task-ids ${_importsnapid} \
 			--query \
 			"ImportSnapshotTasks[*].SnapshotTaskDetail.[Status,Progress,SnapshotId]")
@@ -78,17 +78,16 @@ create_ami() {
 	done
 
 	agb_log "removing bucket ${_BUCKETNAME}"
-	abg_aws s3 rb s3://${_BUCKETNAME} --force
+	agb_aws s3 rb s3://${_BUCKETNAME} --force
 
 	agb_log "registering AMI"
-	abg_aws ec2 register-image --name "${_IMGNAME}" --architecture ${_arch} \
+	agb_aws ec2 register-image --name "${_IMGNAME}" --architecture ${_arch} \
 		--root-device-name /dev/sda1 --virtualization-type hvm \
 		--description "${DESCR}" --block-device-mappings \
 		DeviceName="/dev/sda1",Ebs={SnapshotId=${_snap[2]}}
 }
 
-create_autoinstallconf()
-{
+function agb_create_autoinstallconf() {
 	local _autoinstallconf=${_WRKDIR}/auto_install.conf
 	local _mirror=${MIRROR}
 
@@ -179,27 +178,39 @@ create_iam_role()
 	}
 	EOF
 
-	abg_aws iam create-role --role-name ${_IMGNAME} \
+	agb_aws iam create-role --role-name ${_IMGNAME} \
 		--assume-role-policy-document \
 		"file://${_WRKDIR}/trust-policy.json"
 
-	abg_aws iam put-role-policy --role-name ${_IMGNAME} --policy-name \
+	agb_aws iam put-role-policy --role-name ${_IMGNAME} --policy-name \
 		${_IMGNAME} --policy-document \
 		"file://${_WRKDIR}/role-policy.json"
 }
 
-function create_img_linux()
-{
-	local _bsdrd=${_WRKDIR}/bsd.rd
-    local _rdextract=${_WRKDIR}/bsd.rd.extract
-	local _rdgz=false
-    local _rdmnt=${_WRKDIR}/rdmnt _vndev
+function agb_create_image() {
+	if ${AGB_IS_LINUX}; then
+		agb_linux_create_image
+	elif ${AGB_IS_OPENBSD}; then
+		agb_openbsd_create_image
+	else
+		agb_error "Platform $(uname -s) not supported"
+	fi
 
-	create_install_site_disk
+}
 
-	create_autoinstallconf
+function agb_linux_create_image() {
+	agb_error "Linux create image not implemented"
+}
 
-	agb_log "creating modified bsd.rd for autoinstall"
+function agb_openbsd_create_image() {
+	local _bsdrd=${_WRKDIR}/bsd.rd _rdextract=${_WRKDIR}/bsd.rd.extract
+	local _rdgz=false _rdmnt=${_WRKDIR}/rdmnt _vndev
+
+	agb_openbsd_create_install_site_disk
+
+	agb_create_autoinstallconf
+
+	agb_log "Creating modified bsd.rd for autoinstall"
 	ftp -MV -o ${_bsdrd} ${MIRROR}/${RELEASE}/${ARCH}/bsd.rd
 
 	# 6.9 onwards uses a compressed rd file
@@ -223,12 +234,17 @@ function create_img_linux()
 		mv ${_bsdrd}.gz ${_bsdrd}
 	fi
 
-	agb_log "starting autoinstall inside vmm(4)"
+	agb_log "OpenBSD image ${_IMGNAME} ready at ${_WRKDIR}/bsd.rd, ${_WRKDIR}/siteXX.img, ${_WRKDIR}/installXX.iso ${IMGPATH}"
+}
+
+function agb_openbsd_start_image() {
+
+	agb_log "Starting autoinstall inside vmm(4)"
 
 	vmctl create -s ${IMGSIZE}G ${IMGPATH}
 
 	# handle cu(1) EOT
-	(sleep 10 && vmctl wait ${_IMGNAME} && _tty=$(get_tty ${_IMGNAME}) &&
+	(sleep 10 && vmctl wait ${_IMGNAME} && _tty=$(agb_openbsd_get_tty ${_IMGNAME}) &&
 		vmctl stop -f ${_IMGNAME} && pkill -f "/usr/bin/cu -l ${_tty}")&
 
 	# XXX handle installation error
@@ -237,7 +253,8 @@ function create_img_linux()
 		${_WRKDIR}/siteXX.img -r ${_WRKDIR}/installXX.iso ${_IMGNAME}
 }
 
-function create_install_site() {
+
+function agb_create_install_site() {
 	# XXX bsd.mp + relink directory
 
 	agb_log "creating install.site"
@@ -259,32 +276,23 @@ function create_install_site() {
 	chmod 0555 ${_WRKDIR}/install.site
 }
 
-function create_install_site_disk() {
+function agb_openbsd_create_install_site_disk() {
 	# XXX trap vnd and mount
 
-	local _rel
-    local _relint
-    local _retrydl=true
-    local _vndev
-	local _siteimg=${_WRKDIR}/siteXX.img
-    local _sitemnt=${_WRKDIR}/siteXX
+	local _rel _relint _retrydl=true _vndev
+	local _siteimg=${_WRKDIR}/siteXX.img _sitemnt=${_WRKDIR}/siteXX
 
 	[[ ${RELEASE} == snapshots ]] && _rel=$(uname -r) || _rel=${RELEASE}
 	_relint=${_rel%.*}${_rel#*.}
 
-	create_install_site
+	agb_create_install_site
 
-	agb_log "creating install_site disk"
+	agb_log "Creating install_site disk"
 
-	type qemu-img >/dev/null 2>&1 || agb_error "package \"qemu\" is not installed"
-	type parted >/dev/null 2>&1 || agb_error "package \"parted\" is not installed"
-	# FIXME CS qemu-img convert -f raw -O qcow2 prueba.img prueba.qcow2
-	# FIXME CS qemu-img resize prueba.qcow2 +20G
-	# parted -s ${_siteimg} mklabel msdos
-	# parted -s ${_siteimg} mkpart primary a6 2048 2097151
-
-	qemu-img create ${_siteimg} 1G 
-	echo -e "label: dos\nstart=2048, size=2095104, type=a6" | sfdisk ${_siteimg}
+	vmctl create -s 1G ${_siteimg}
+	_vndev="$(vnconfig ${_siteimg})"
+	fdisk -iy ${_vndev}
+	echo "a a\n\n\n\nw\nq\n" | disklabel -E ${_vndev}
 	newfs ${_vndev}a
 
 	install -d ${_sitemnt}
@@ -303,8 +311,7 @@ function create_install_site_disk() {
 
 	agb_log "downloading ec2-init"
 	install -d ${_WRKDIR}/usr/local/libexec/
-	ftp -o ${_WRKDIR}/usr/local/libexec/ec2-init \
-		https://raw.githubusercontent.com/ajacoutot/aws-openbsd/master/ec2-init.sh
+	cp aws-gazo-bot-ec2-init-openbsd ${_WRKDIR}/usr/local/libexec/ec2-init
 
 	agb_log "storing siteXX.tgz into install_site disk"
 	cd ${_WRKDIR} && tar czf \
@@ -315,8 +322,7 @@ function create_install_site_disk() {
 	vnconfig -u ${_vndev}
 }
 
-get_tty()
-{
+function agb_openbsd_get_tty() {
 	local _tty _vmname=$1
 	[[ -n ${_vmname} ]]
 
@@ -326,12 +332,12 @@ get_tty()
 }
 
 function agb_error() {
-	echo $* 1>&2
+	echo "[AGB] $(date +%Y-%m-%d\ %H:%M:%S) ERR " $* 1>&2
     return 1
 }
 
 function agb_log() {
-	echo $*
+	echo "[AGB] $(date +%Y-%m-%d\ %H:%M:%S) INF " $*
 }
 
 function agb_setup_virtual_machine() {
@@ -354,13 +360,13 @@ function agb_linux_setup_virtual_machine() {
 
 function agb_openbsd_setup_virtual_machine() {
 	if ! $(rcctl check vmd >/dev/null); then
-		pr_title "starting vmd(8)"
+		agb_log "starting vmd(8)"
 		rcctl start vmd
 		_RESET_VMD=true
 	fi
 }
 
-function abg_aws {
+function agb_aws {
 	type aws >/dev/null 2>&1 || agb_error "package \"awscli\" is not installed"
     local _aws_cmd=aws
     if [[ -n $AWSPROFILE ]]; then
@@ -370,14 +376,14 @@ function abg_aws {
     echo $_aws_cmd $*
 }
 
-function abg_trap_handler() {
+function agb_trap_handler() {
 	set +e # we're trapped
 
-	if abg_aws iam get-role --role-name ${_IMGNAME} >/dev/null 2>&1; then
+	if agb_aws iam get-role --role-name ${_IMGNAME} >/dev/null 2>&1; then
 		agb_log "removing IAM role"
-		abg_aws iam delete-role-policy --role-name ${_IMGNAME} \
+		agb_aws iam delete-role-policy --role-name ${_IMGNAME} \
 			--policy-name ${_IMGNAME} 2>/dev/null
-		abg_aws iam delete-role --role-name ${_IMGNAME} 2>/dev/null
+		agb_aws iam delete-role --role-name ${_IMGNAME} 2>/dev/null
 	fi
 
 	if ${_RESET_VIRT:-false}; then
@@ -423,7 +429,7 @@ while getopts a:d:i:m:nr:s:p: arg; do
 	esac
 done
 
-trap 'abg_trap_handler' EXIT
+trap 'agb_trap_handler' EXIT
 trap exit HUP INT TERM
 
 _TS=$(date -u +%G%m%dT%H%M%SZ)
@@ -501,17 +507,17 @@ if ${CREATE_AMI}; then
 			agb_error "package \"virt-manager\" is not installed"
 	elif ${AGB_IS_OPENBSD}; then
 		type vmdktool >/dev/null 2>&1 ||
-			pr_err "package \"vmdktool\" is not installed"
+			agb_error "package \"vmdktool\" is not installed"
 	else
 		agb_error "Platform $(uname -r) not supported"
 	fi
-	abg_aws ec2 describe-regions --region-names us-east-1 >/dev/null ||
+	agb_aws ec2 describe-regions --region-names us-east-1 >/dev/null ||
 		agb_error "awscli is not properly configured"
 fi
 
 if [[ ! -f ${IMGPATH} ]]; then
 	agb_setup_virtual_machine
-	create_img
+	agb_create_image
 fi
 
 if ${CREATE_AMI}; then
