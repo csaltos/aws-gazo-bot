@@ -1,4 +1,4 @@
-#!/usr/bin/bash
+#!/usr/bin/env bash
 #
 # Original work Copyright (c) 2015, 2016, 2019 Antoine Jacoutot <ajacoutot@openbsd.org>
 # Modified work Copyright (c) 2022 Carlos Saltos
@@ -237,7 +237,23 @@ function agb_openbsd_create_image() {
 	agb_log "OpenBSD image ${_IMGNAME} ready at ${_WRKDIR}/bsd.rd, ${_WRKDIR}/siteXX.img, ${_WRKDIR}/installXX.iso ${IMGPATH}"
 }
 
+function agb_start_image() {
+	if ${AGB_IS_LINUX}; then
+		agb_linux_start_image
+	elif ${AGB_IS_OPENBSD}; then
+		agb_openbsd_start_image
+	else
+		agb_error "Platform $(uname -r) not supported"
+	fi
+}
+
+function agb_linux_start_image() {
+	grep -q -E "vmx|svm" /proc/cpuinfo || agb_error "No support for virtual machines"
+	agb_error "Linux start image not implemented"
+}
+
 function agb_openbsd_start_image() {
+	grep -q ^vmm0 /var/run/dmesg.boot || agb_error "Need vmm(4) support"
 
 	agb_log "Starting autoinstall inside vmm(4)"
 
@@ -257,7 +273,7 @@ function agb_openbsd_start_image() {
 function agb_create_install_site() {
 	# XXX bsd.mp + relink directory
 
-	agb_log "creating install.site"
+	agb_log "Creating install.site file"
 
 	cat <<-'EOF' >>${_WRKDIR}/install.site
 	chown root:bin /usr/local/libexec/ec2-init
@@ -287,12 +303,12 @@ function agb_openbsd_create_install_site_disk() {
 
 	agb_create_install_site
 
-	agb_log "Creating install_site disk"
+	agb_log "Creating install disk"
 
 	vmctl create -s 1G ${_siteimg}
 	_vndev="$(vnconfig ${_siteimg})"
 	fdisk -iy ${_vndev}
-	echo "a a\n\n\n\nw\nq\n" | disklabel -E ${_vndev}
+	echo -e "a a\n\n\n\nw\nq\n" | disklabel -E ${_vndev}
 	newfs ${_vndev}a
 
 	install -d ${_sitemnt}
@@ -311,7 +327,7 @@ function agb_openbsd_create_install_site_disk() {
 
 	agb_log "downloading ec2-init"
 	install -d ${_WRKDIR}/usr/local/libexec/
-	cp aws-gazo-bot-ec2-init-openbsd ${_WRKDIR}/usr/local/libexec/ec2-init
+	cp aws-gazo-bot-ec2-init-openbsd.sh ${_WRKDIR}/usr/local/libexec/ec2-init
 
 	agb_log "storing siteXX.tgz into install_site disk"
 	cd ${_WRKDIR} && tar czf \
@@ -487,13 +503,6 @@ echo RELEASE=$RELEASE
 # requirements checks to build the RAW image
 if [[ ! -f ${IMGPATH} ]]; then
 	(($(id -u) != 0)) && agb_error "need root privileges"
-	if ${AGB_IS_LINUX}; then
-	    grep -q -E "vmx|svm" /proc/cpuinfo || agb_error "No support for virtual machines"
-	elif ${AGB_IS_OPENBSD}; then
-		grep -q ^vmm0 /var/run/dmesg.boot || agb_error "Need vmm(4) support"
-	else
-		agb_error "Platform $(uname -r) not supported"
-	fi
 	[[ ${_IMGNAME} != [[:alpha:]]* ]] &&
 		agb_error "image name must start with a letter"
 fi
@@ -516,8 +525,9 @@ if ${CREATE_AMI}; then
 fi
 
 if [[ ! -f ${IMGPATH} ]]; then
-	agb_setup_virtual_machine
 	agb_create_image
+	agb_setup_virtual_machine
+	agb_start_image
 fi
 
 if ${CREATE_AMI}; then
