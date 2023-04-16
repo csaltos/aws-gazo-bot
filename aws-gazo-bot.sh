@@ -18,23 +18,36 @@
 set -e
 umask 022
 
+AGB_IS_LINUX=false
+AGB_IS_OPENBSD=false
+
+if [[ "$(uname -s)" == Linux ]]; then
+	AGB_IS_LINUX=true
+fi
+
+if [[ "$(uname -s)" == OpenBSD ]]; then
+	AGB_IS_OPENBSD=true
+fi
+
+readonly AGB_IS_LINUX AGB_IS_OPENBSD
+
 create_ami() {
 	local _arch=${ARCH} _bucket_conf _importsnapid _snap
-	local _region=$(aws configure get region)
+	local _region=$(abg_aws configure get region)
 
 	[[ ${_region} == us-east-1 ]] ||
 		_bucket_conf="--create-bucket-configuration LocationConstraint=${_region}"
 
 	! [[ ${_arch} == amd64 ]] || _arch=x86_64
 
-	pr_title "converting image to stream-based VMDK"
+	agb_log "converting image to stream-based VMDK"
 	vmdktool -v ${IMGPATH}.vmdk ${IMGPATH}
 
-	pr_title "uploading image to S3"
-	aws s3api create-bucket --bucket ${_BUCKETNAME} ${_bucket_conf}
-	aws s3 cp ${IMGPATH}.vmdk s3://${_BUCKETNAME}
+	agb_log "uploading image to S3"
+	abg_aws s3api create-bucket --bucket ${_BUCKETNAME} ${_bucket_conf}
+	abg_aws s3 cp ${IMGPATH}.vmdk s3://${_BUCKETNAME}
 
-	pr_title "converting VMDK to snapshot"
+	agb_log "converting VMDK to snapshot"
 	cat <<-EOF >>${_WRKDIR}/containers.json
 	{
 	  "Description": "${DESCR}",
@@ -47,15 +60,15 @@ create_ami() {
 	EOF
 
 	# Cannot use import-image: "ClientError: Unknown OS / Missing OS files."
-	#aws ec2 import-image --description "${DESCR}" --disk-containers \
+	#abg_aws ec2 import-image --description "${DESCR}" --disk-containers \
 	#	file://"${_WRKDIR}/containers.json"
 
-	_importsnapid=$(aws ec2 import-snapshot --description "${DESCR}" \
+	_importsnapid=$(abg_aws ec2 import-snapshot --description "${DESCR}" \
 		--disk-container file://"${_WRKDIR}/containers.json" \
 		--role-name ${_IMGNAME} --query "ImportTaskId" --output text)
 
 	while true; do
-		set -A _snap -- $(aws ec2 describe-import-snapshot-tasks \
+		set -A _snap -- $(abg_aws ec2 describe-import-snapshot-tasks \
 			--output text --import-task-ids ${_importsnapid} \
 			--query \
 			"ImportSnapshotTasks[*].SnapshotTaskDetail.[Status,Progress,SnapshotId]")
@@ -64,11 +77,11 @@ create_ami() {
 		sleep 10
 	done
 
-	pr_title "removing bucket ${_BUCKETNAME}"
-	aws s3 rb s3://${_BUCKETNAME} --force
+	agb_log "removing bucket ${_BUCKETNAME}"
+	abg_aws s3 rb s3://${_BUCKETNAME} --force
 
-	pr_title "registering AMI"
-	aws ec2 register-image --name "${_IMGNAME}" --architecture ${_arch} \
+	agb_log "registering AMI"
+	abg_aws ec2 register-image --name "${_IMGNAME}" --architecture ${_arch} \
 		--root-device-name /dev/sda1 --virtualization-type hvm \
 		--description "${DESCR}" --block-device-mappings \
 		DeviceName="/dev/sda1",Ebs={SnapshotId=${_snap[2]}}
@@ -82,7 +95,7 @@ create_autoinstallconf()
 	_mirror=${_mirror#*://}
 	_mirror=${_mirror%%/*}
 
-	pr_title "creating auto_install.conf"
+	agb_log "creating auto_install.conf"
 
 	cat <<-EOF >>${_autoinstallconf}
 	System hostname = openbsd
@@ -116,7 +129,7 @@ create_autoinstallconf()
 
 create_iam_role()
 {
-	pr_title "creating IAM role"
+	agb_log "creating IAM role"
 
 	cat <<-'EOF' >>${_WRKDIR}/trust-policy.json
 	{
@@ -166,25 +179,27 @@ create_iam_role()
 	}
 	EOF
 
-	aws iam create-role --role-name ${_IMGNAME} \
+	abg_aws iam create-role --role-name ${_IMGNAME} \
 		--assume-role-policy-document \
 		"file://${_WRKDIR}/trust-policy.json"
 
-	aws iam put-role-policy --role-name ${_IMGNAME} --policy-name \
+	abg_aws iam put-role-policy --role-name ${_IMGNAME} --policy-name \
 		${_IMGNAME} --policy-document \
 		"file://${_WRKDIR}/role-policy.json"
 }
 
-create_img()
+function create_img_linux()
 {
-	local _bsdrd=${_WRKDIR}/bsd.rd _rdextract=${_WRKDIR}/bsd.rd.extract
-	local _rdgz=false _rdmnt=${_WRKDIR}/rdmnt _vndev
+	local _bsdrd=${_WRKDIR}/bsd.rd
+    local _rdextract=${_WRKDIR}/bsd.rd.extract
+	local _rdgz=false
+    local _rdmnt=${_WRKDIR}/rdmnt _vndev
 
 	create_install_site_disk
 
 	create_autoinstallconf
 
-	pr_title "creating modified bsd.rd for autoinstall"
+	agb_log "creating modified bsd.rd for autoinstall"
 	ftp -MV -o ${_bsdrd} ${MIRROR}/${RELEASE}/${ARCH}/bsd.rd
 
 	# 6.9 onwards uses a compressed rd file
@@ -208,7 +223,7 @@ create_img()
 		mv ${_bsdrd}.gz ${_bsdrd}
 	fi
 
-	pr_title "starting autoinstall inside vmm(4)"
+	agb_log "starting autoinstall inside vmm(4)"
 
 	vmctl create -s ${IMGSIZE}G ${IMGPATH}
 
@@ -222,11 +237,10 @@ create_img()
 		${_WRKDIR}/siteXX.img -r ${_WRKDIR}/installXX.iso ${_IMGNAME}
 }
 
-create_install_site()
-{
+function create_install_site() {
 	# XXX bsd.mp + relink directory
 
-	pr_title "creating install.site"
+	agb_log "creating install.site"
 
 	cat <<-'EOF' >>${_WRKDIR}/install.site
 	chown root:bin /usr/local/libexec/ec2-init
@@ -245,46 +259,54 @@ create_install_site()
 	chmod 0555 ${_WRKDIR}/install.site
 }
 
-create_install_site_disk()
-{
+function create_install_site_disk() {
 	# XXX trap vnd and mount
 
-	local _rel _relint _retrydl=true _vndev
-	local _siteimg=${_WRKDIR}/siteXX.img _sitemnt=${_WRKDIR}/siteXX
+	local _rel
+    local _relint
+    local _retrydl=true
+    local _vndev
+	local _siteimg=${_WRKDIR}/siteXX.img
+    local _sitemnt=${_WRKDIR}/siteXX
 
 	[[ ${RELEASE} == snapshots ]] && _rel=$(uname -r) || _rel=${RELEASE}
 	_relint=${_rel%.*}${_rel#*.}
 
 	create_install_site
 
-	pr_title "creating install_site disk"
+	agb_log "creating install_site disk"
 
-	vmctl create -s 1G ${_siteimg}
-	_vndev="$(vnconfig ${_siteimg})"
-	fdisk -iy ${_vndev}
-	echo "a a\n\n\n\nw\nq\n" | disklabel -E ${_vndev}
+	type qemu-img >/dev/null 2>&1 || agb_error "package \"qemu\" is not installed"
+	type parted >/dev/null 2>&1 || agb_error "package \"parted\" is not installed"
+	# FIXME CS qemu-img convert -f raw -O qcow2 prueba.img prueba.qcow2
+	# FIXME CS qemu-img resize prueba.qcow2 +20G
+	# parted -s ${_siteimg} mklabel msdos
+	# parted -s ${_siteimg} mkpart primary a6 2048 2097151
+
+	qemu-img create ${_siteimg} 1G 
+	echo -e "label: dos\nstart=2048, size=2095104, type=a6" | sfdisk ${_siteimg}
 	newfs ${_vndev}a
 
 	install -d ${_sitemnt}
 	mount /dev/${_vndev}a ${_sitemnt}
 	install -d ${_sitemnt}/${_rel}/${ARCH}
 
-	pr_title "downloading installation ISO"
+	agb_log "downloading installation ISO"
 	while ! ftp -o ${_WRKDIR}/installXX.iso \
 		${MIRROR}/${RELEASE}/${ARCH}/install${_relint}.iso; do
 		# in case we're running an X.Y snapshot while X.Z is out;
 		# (e.g. running on 6.4-current and installing 6.5-beta)
-		${_retrydl} || pr_err "cannot download installation ISO"
+		${_retrydl} || agb_error "cannot download installation ISO"
 		_relint=$((_relint+1))
 		_retrydl=false
 	done
 
-	pr_title "downloading ec2-init"
+	agb_log "downloading ec2-init"
 	install -d ${_WRKDIR}/usr/local/libexec/
 	ftp -o ${_WRKDIR}/usr/local/libexec/ec2-init \
 		https://raw.githubusercontent.com/ajacoutot/aws-openbsd/master/ec2-init.sh
 
-	pr_title "storing siteXX.tgz into install_site disk"
+	agb_log "storing siteXX.tgz into install_site disk"
 	cd ${_WRKDIR} && tar czf \
 		${_sitemnt}/${_rel}/${ARCH}/site${_relint}.tgz ./install.site \
 			./usr/local/libexec/ec2-init
@@ -303,19 +325,34 @@ get_tty()
 	done
 }
 
-pr_err()
-{
-	echo "${0##*/}: ${1}" 1>&2 && return ${2:-1}
+function agb_error() {
+	echo $* 1>&2
+    return 1
 }
 
-pr_title()
-{
-	local _line=$(printf "%80s" | tr ' ' '=')
-	echo "${_line}\n| ${@}\n${_line}"
+function agb_log() {
+	echo $*
 }
 
-setup_vmd()
-{
+function agb_setup_virtual_machine() {
+	if ${AGB_IS_LINUX}; then
+		agb_linux_setup_virtual_machine
+	elif ${AGB_IS_OPENBSD}; then
+		agb_openbsd_setup_virtual_machine
+	else
+		agb_error "Platform $(uname -s) not supported"
+	fi
+}
+
+function agb_linux_setup_virtual_machine() {
+	if ! $(systemctl is-active libvirtd.service >/dev/null); then
+		agb_log "starting libvirt service"
+		systemctl start libvirtd.service
+		_RESET_VIRT=true
+	fi
+}
+
+function agb_openbsd_setup_virtual_machine() {
 	if ! $(rcctl check vmd >/dev/null); then
 		pr_title "starting vmd(8)"
 		rcctl start vmd
@@ -323,43 +360,56 @@ setup_vmd()
 	fi
 }
 
-trap_handler()
-{
+function abg_aws {
+	type aws >/dev/null 2>&1 || agb_error "package \"awscli\" is not installed"
+    local _aws_cmd=aws
+    if [[ -n $AWSPROFILE ]]; then
+        _aws_cmd="aws $1 --profile $AWSPROFILE"
+        shift
+    fi
+    echo $_aws_cmd $*
+}
+
+function abg_trap_handler() {
 	set +e # we're trapped
 
-	if aws iam get-role --role-name ${_IMGNAME} >/dev/null 2>&1; then
-		pr_title "removing IAM role"
-		aws iam delete-role-policy --role-name ${_IMGNAME} \
+	if abg_aws iam get-role --role-name ${_IMGNAME} >/dev/null 2>&1; then
+		agb_log "removing IAM role"
+		abg_aws iam delete-role-policy --role-name ${_IMGNAME} \
 			--policy-name ${_IMGNAME} 2>/dev/null
-		aws iam delete-role --role-name ${_IMGNAME} 2>/dev/null
+		abg_aws iam delete-role --role-name ${_IMGNAME} 2>/dev/null
+	fi
+
+	if ${_RESET_VIRT:-false}; then
+		agb_log "stopping libvirt service"
+		systemctl stop libvirtd.service >/dev/null
 	fi
 
 	if ${_RESET_VMD:-false}; then
-		pr_title "stopping vmd(8)"
+		agb_log "stopping vmd(8)"
 		rcctl stop vmd >/dev/null
 	fi
 
 	if [[ -n ${_WRKDIR} ]]; then
 		rmdir ${_WRKDIR} 2>/dev/null ||
-			pr_title "work directory: ${_WRKDIR}"
+			agb_log "work directory: ${_WRKDIR}"
 	fi
 }
 
-usage()
-{
+function usage() {
 	echo "usage: ${0##*/}
        -a \"architecture\" -- default to \"amd64\"
        -d \"description\" -- AMI description; defaults to \"openbsd-\$release-\$timestamp\"
        -i \"path to RAW image\" -- use image at path instead of creating one
-       -m \"install mirror\" -- defaults to installurl(5) or \"https://cdn.openbsd.org/pub/OpenBSD\"
+       -m \"install mirror\" -- defaults to \"https://cdn.openbsd.org/pub/OpenBSD\"
        -n -- only create a RAW image (don't convert to an AMI nor push to AWS)
        -r \"release\" -- e.g \"6.5\"; default to \"snapshots\"
-       -s \"image size in GB\" -- default to \"12\""
-
+       -s \"image size in GB\" -- default to \"12\"
+       -p \"AWS profile\" -- use a different AWS profile then the default authentication"
 	return 1
 }
 
-while getopts a:d:i:m:nr:s: arg; do
+while getopts a:d:i:m:nr:s:p: arg; do
 	case ${arg} in
 	a)	ARCH="${OPTARG}" ;;
 	d)	DESCR="${OPTARG}" ;;
@@ -368,11 +418,12 @@ while getopts a:d:i:m:nr:s: arg; do
 	n)	CREATE_AMI=false ;;
 	r)	RELEASE="${OPTARG}" ;;
 	s)	IMGSIZE="${OPTARG}" ;;
+    p)  AWSPROFILE="${OPTARG}" ;;
 	*)	usage ;;
 	esac
 done
 
-trap 'trap_handler' EXIT
+trap 'abg_trap_handler' EXIT
 trap exit HUP INT TERM
 
 _TS=$(date -u +%G%m%dT%H%M%SZ)
@@ -390,11 +441,17 @@ IMGSIZE=${IMGSIZE:-12}
 RELEASE=${RELEASE:-snapshots}
 
 if [[ -z ${MIRROR} ]]; then
-	MIRROR=$(while read _line; do _line=${_line%%#*}; [[ -n ${_line} ]] &&
-		print -r -- "${_line}"; done </etc/installurl | tail -1) \
-		2>/dev/null
-	[[ ${MIRROR} == @(http|https)://* ]] ||
-		MIRROR="https://cdn.openbsd.org/pub/OpenBSD"
+	if ${AGB_IS_LINUX}; then
+	    MIRROR="https://cdn.openbsd.org/pub/OpenBSD"
+	elif ${AGB_IS_OPENBSD}; then
+		MIRROR=$(while read _line; do _line=${_line%%#*}; [[ -n ${_line} ]] &&
+			print -r -- "${_line}"; done </etc/installurl | tail -1) \
+			2>/dev/null
+		[[ ${MIRROR} == @(http|https)://* ]] ||
+			MIRROR="https://cdn.openbsd.org/pub/OpenBSD"
+	else
+		agb_error "Platform $(uname -r) not supported"
+	fi
 fi
 
 _IMGNAME=openbsd-${RELEASE}-${ARCH}-${_TS}
@@ -408,30 +465,52 @@ DESCR=${DESCR:-${_IMGNAME}}
 readonly _BUCKETNAME _IMGNAME _TS _WRKDIR HTTP_PROXY HTTPS_PROXY
 readonly CREATE_AMI DESCR IMGPATH IMGSIZE MIRROR RELEASE
 
+echo _BUCKETNAME=$_BUCKETNAME
+echo _IMGNAME=$_IMGNAME
+echo _TS=$_TS
+echo _WRKDIR=$_WRKDIR
+echo HTTP_PROXY=$HTTP_PROXY
+echo HTTPS_PROXY=$HTTPS_PROXY
+echo CREATE_AMI=$CREATE_AMI
+echo DESCR=$DESCR
+echo IMGPATH=$IMGPATH
+echo IMGSIZE=$IMGSIZE
+echo MIRROR=$MIRROR
+echo RELEASE=$RELEASE
+
 # requirements checks to build the RAW image
 if [[ ! -f ${IMGPATH} ]]; then
-	(($(id -u) != 0)) && pr_err "need root privileges"
-	grep -q ^vmm0 /var/run/dmesg.boot || pr_err "need vmm(4) support"
-	[[ ${_IMGNAME}} != [[:alpha:]]* ]] &&
-		pr_err "image name must start with a letter"
+	(($(id -u) != 0)) && agb_error "need root privileges"
+	if ${AGB_IS_LINUX}; then
+	    grep -q -E "vmx|svm" /proc/cpuinfo || agb_error "No support for virtual machines"
+	elif ${AGB_IS_OPENBSD}; then
+		grep -q ^vmm0 /var/run/dmesg.boot || agb_error "Need vmm(4) support"
+	else
+		agb_error "Platform $(uname -r) not supported"
+	fi
+	[[ ${_IMGNAME} != [[:alpha:]]* ]] &&
+		agb_error "image name must start with a letter"
 fi
 
 # requirements checks to build and register the AMI
 if ${CREATE_AMI}; then
 	[[ ${ARCH} == i386 ]] &&
-		pr_err "${ARCH} lacks xen(4) support to run on AWS"
-	type aws >/dev/null 2>&1 || pr_err "package \"awscli\" is not installed"
-	type vmdktool >/dev/null 2>&1 ||
-		pr_err "package \"vmdktool\" is not installed"
-	aws ec2 describe-regions --region-names us-east-1 >/dev/null ||
-		pr_err "you may need to export:
-AWS_CONFIG_FILE
-AWS_DEFAULT_PROFILE
-AWS_SHARED_CREDENTIALS_FILE"
+		agb_error "${ARCH} lacks xen(4) support to run on AWS"
+	if ${AGB_IS_LINUX}; then
+		type virsh >/dev/null 2>&1 ||
+			agb_error "package \"virt-manager\" is not installed"
+	elif ${AGB_IS_OPENBSD}; then
+		type vmdktool >/dev/null 2>&1 ||
+			pr_err "package \"vmdktool\" is not installed"
+	else
+		agb_error "Platform $(uname -r) not supported"
+	fi
+	abg_aws ec2 describe-regions --region-names us-east-1 >/dev/null ||
+		agb_error "awscli is not properly configured"
 fi
 
 if [[ ! -f ${IMGPATH} ]]; then
-	setup_vmd
+	agb_setup_virtual_machine
 	create_img
 fi
 
