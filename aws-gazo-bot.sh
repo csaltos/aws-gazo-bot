@@ -234,7 +234,7 @@ function agb_openbsd_create_image() {
 		mv ${_bsdrd}.gz ${_bsdrd}
 	fi
 
-	agb_log "OpenBSD image ${_IMGNAME} ready at ${_WRKDIR}/bsd.rd, ${_WRKDIR}/siteXX.img, ${_WRKDIR}/installXX.iso ${IMGPATH}"
+	agb_log "OpenBSD image ready at ${IMGPATH}"
 }
 
 function agb_start_image() {
@@ -265,12 +265,19 @@ function agb_openbsd_start_image() {
 
 	# XXX handle installation error
 	# (e.g. ftp: raw.githubusercontent.com: no address associated with name)
-	vmctl start -b ${_WRKDIR}/bsd.rd -c -L -d ${IMGPATH} -d \
-		${_WRKDIR}/siteXX.img -r ${_WRKDIR}/installXX.iso ${_IMGNAME}
+	if [[ -f ${_WRKDIR}/installXX.iso ]]; then
+		vmctl start -b ${_WRKDIR}/bsd.rd -c -L -d ${IMGPATH} -d \
+			${_WRKDIR}/siteXX.img -r ${_WRKDIR}/installXX.iso ${_IMGNAME}
+	elif [[ -f ${_WRKDIR}/installXX.img ]]; then
+		vmctl start -b ${_WRKDIR}/bsd.rd -c -L -d ${IMGPATH} -d \
+			${_WRKDIR}/siteXX.img -d ${_WRKDIR}/installXX.img ${_IMGNAME}
+	else
+		agb_error "No installation image found"
+	fi
 }
 
 
-function agb_create_install_site() {
+function agb_create_install_site_file() {
 	# XXX bsd.mp + relink directory
 
 	agb_log "Creating install.site file"
@@ -295,13 +302,13 @@ function agb_create_install_site() {
 function agb_openbsd_create_install_site_disk() {
 	# XXX trap vnd and mount
 
-	local _rel _relint _retrydl=true _vndev
+	local _rel _relint _vndev
 	local _siteimg=${_WRKDIR}/siteXX.img _sitemnt=${_WRKDIR}/siteXX
 
 	[[ ${RELEASE} == snapshots ]] && _rel=$(uname -r) || _rel=${RELEASE}
 	_relint=${_rel%.*}${_rel#*.}
 
-	agb_create_install_site
+	agb_create_install_site_file
 
 	agb_log "Creating install disk"
 
@@ -315,21 +322,24 @@ function agb_openbsd_create_install_site_disk() {
 	mount /dev/${_vndev}a ${_sitemnt}
 	install -d ${_sitemnt}/${_rel}/${ARCH}
 
-	agb_log "downloading installation ISO"
-	while ! ftp -o ${_WRKDIR}/installXX.iso \
-		${MIRROR}/${RELEASE}/${ARCH}/install${_relint}.iso; do
-		# in case we're running an X.Y snapshot while X.Z is out;
-		# (e.g. running on 6.4-current and installing 6.5-beta)
-		${_retrydl} || agb_error "cannot download installation ISO"
-		_relint=$((_relint+1))
-		_retrydl=false
-	done
+	agb_log "Downloading installation image"
+	ftp -o ${_WRKDIR}/installXX.iso ${MIRROR}/${RELEASE}/${ARCH}/install${_relint}.iso || {
+		ftp -o ${_WRKDIR}/installXX.img ${MIRROR}/${RELEASE}/${ARCH}/install${_relint}.img || {
+			# in case we're running an X.Y snapshot while X.Z is out;
+			# (e.g. running on 6.4-current and installing 6.5-beta)
+			_relint=$((_relint+1))
+			ftp -o ${_WRKDIR}/installXX.iso ${MIRROR}/${RELEASE}/${ARCH}/install${_relint}.iso || {
+				ftp -o ${_WRKDIR}/installXX.img ${MIRROR}/${RELEASE}/${ARCH}/install${_relint}.img || {
+					agb_error "Cannot download installation image"
+				}
+			}
+		}
+	}
 
-	agb_log "downloading ec2-init"
 	install -d ${_WRKDIR}/usr/local/libexec/
 	cp aws-gazo-bot-ec2-init-openbsd.sh ${_WRKDIR}/usr/local/libexec/ec2-init
 
-	agb_log "storing siteXX.tgz into install_site disk"
+	agb_log "Storing siteXX.tgz into install_site disk"
 	cd ${_WRKDIR} && tar czf \
 		${_sitemnt}/${_rel}/${ARCH}/site${_relint}.tgz ./install.site \
 			./usr/local/libexec/ec2-init
@@ -395,26 +405,29 @@ function agb_aws {
 function agb_trap_handler() {
 	set +e # we're trapped
 
-	if agb_aws iam get-role --role-name ${_IMGNAME} >/dev/null 2>&1; then
-		agb_log "removing IAM role"
-		agb_aws iam delete-role-policy --role-name ${_IMGNAME} \
-			--policy-name ${_IMGNAME} 2>/dev/null
-		agb_aws iam delete-role --role-name ${_IMGNAME} 2>/dev/null
+	if ${UPLOAD_AMI}; then
+		if agb_aws iam get-role --role-name ${_IMGNAME} >/dev/null 2>&1; then
+			agb_log "removing IAM role"
+			agb_aws iam delete-role-policy --role-name ${_IMGNAME} \
+				--policy-name ${_IMGNAME} 2>/dev/null
+			agb_aws iam delete-role --role-name ${_IMGNAME} 2>/dev/null
+		fi
 	fi
 
-	if ${_RESET_VIRT:-false}; then
-		agb_log "stopping libvirt service"
-		systemctl stop libvirtd.service >/dev/null
-	fi
-
-	if ${_RESET_VMD:-false}; then
-		agb_log "stopping vmd(8)"
-		rcctl stop vmd >/dev/null
+	if ${RUN_IMG}; then
+		if ${_RESET_VIRT:-false}; then
+			agb_log "stopping libvirt service"
+			systemctl stop libvirtd.service >/dev/null
+		fi
+		if ${_RESET_VMD:-false}; then
+			agb_log "stopping vmd(8)"
+			rcctl stop vmd >/dev/null
+		fi
 	fi
 
 	if [[ -n ${_WRKDIR} ]]; then
 		rmdir ${_WRKDIR} 2>/dev/null ||
-			agb_log "work directory: ${_WRKDIR}"
+			agb_log "Work directory: ${_WRKDIR}"
 	fi
 }
 
@@ -424,22 +437,24 @@ function usage() {
        -d \"description\" -- AMI description; defaults to \"openbsd-\$release-\$timestamp\"
        -i \"path to RAW image\" -- use image at path instead of creating one
        -m \"install mirror\" -- defaults to \"https://cdn.openbsd.org/pub/OpenBSD\"
-       -n -- only create a RAW image (don't convert to an AMI nor push to AWS)
-       -r \"release\" -- e.g \"6.5\"; default to \"snapshots\"
+       -r \"release\" -- e.g \"7.3\"; default to \"snapshots\"
        -s \"image size in GB\" -- default to \"12\"
-       -p \"AWS profile\" -- use a different AWS profile then the default authentication"
+	   -v -- run the image as a local virtual machine
+       -u -- upload the image to AWS
+       -p \"AWS profile\" -- use a different AWS profile than the default authentication"
 	return 1
 }
 
-while getopts a:d:i:m:nr:s:p: arg; do
+while getopts a:d:i:m:r:s:vup: arg; do
 	case ${arg} in
 	a)	ARCH="${OPTARG}" ;;
 	d)	DESCR="${OPTARG}" ;;
 	i)	IMGPATH="${OPTARG}" ;;
 	m)	MIRROR="${OPTARG}" ;;
-	n)	CREATE_AMI=false ;;
 	r)	RELEASE="${OPTARG}" ;;
 	s)	IMGSIZE="${OPTARG}" ;;
+	v)  RUN_IMG=true ;;
+	u)	UPLOAD_AMI=true ;;
     p)  AWSPROFILE="${OPTARG}" ;;
 	*)	usage ;;
 	esac
@@ -458,8 +473,9 @@ if [[ -n ${http_proxy} ]]; then
 fi
 
 ARCH=${ARCH:-amd64}
-CREATE_AMI=${CREATE_AMI:-true}
+UPLOAD_AMI=${UPLOAD_AMI:-false}
 IMGSIZE=${IMGSIZE:-12}
+RUN_IMG=${RUN_IMG:-false}
 RELEASE=${RELEASE:-snapshots}
 
 if [[ -z ${MIRROR} ]]; then
@@ -467,7 +483,7 @@ if [[ -z ${MIRROR} ]]; then
 	    MIRROR="https://cdn.openbsd.org/pub/OpenBSD"
 	elif ${AGB_IS_OPENBSD}; then
 		MIRROR=$(while read _line; do _line=${_line%%#*}; [[ -n ${_line} ]] &&
-			print -r -- "${_line}"; done </etc/installurl | tail -1) \
+			echo "${_line}"; done </etc/installurl | tail -1) \
 			2>/dev/null
 		[[ ${MIRROR} == @(http|https)://* ]] ||
 			MIRROR="https://cdn.openbsd.org/pub/OpenBSD"
@@ -485,7 +501,7 @@ _BUCKETNAME=$(echo ${_IMGNAME} | tr '[:upper:]' '[:lower:]')-${RANDOM}
 DESCR=${DESCR:-${_IMGNAME}}
 
 readonly _BUCKETNAME _IMGNAME _TS _WRKDIR HTTP_PROXY HTTPS_PROXY
-readonly CREATE_AMI DESCR IMGPATH IMGSIZE MIRROR RELEASE
+readonly UPLOAD_AMI DESCR IMGPATH IMGSIZE MIRROR RELEASE RUN_IMG
 
 echo _BUCKETNAME=$_BUCKETNAME
 echo _IMGNAME=$_IMGNAME
@@ -493,12 +509,13 @@ echo _TS=$_TS
 echo _WRKDIR=$_WRKDIR
 echo HTTP_PROXY=$HTTP_PROXY
 echo HTTPS_PROXY=$HTTPS_PROXY
-echo CREATE_AMI=$CREATE_AMI
+echo UPLOAD_AMI=$UPLOAD_AMI
 echo DESCR=$DESCR
 echo IMGPATH=$IMGPATH
 echo IMGSIZE=$IMGSIZE
 echo MIRROR=$MIRROR
 echo RELEASE=$RELEASE
+echo RUN_IMG=$RUN_IMG
 
 # requirements checks to build the RAW image
 if [[ ! -f ${IMGPATH} ]]; then
@@ -508,7 +525,7 @@ if [[ ! -f ${IMGPATH} ]]; then
 fi
 
 # requirements checks to build and register the AMI
-if ${CREATE_AMI}; then
+if ${UPLOAD_AMI}; then
 	[[ ${ARCH} == i386 ]] &&
 		agb_error "${ARCH} lacks xen(4) support to run on AWS"
 	if ${AGB_IS_LINUX}; then
@@ -526,11 +543,14 @@ fi
 
 if [[ ! -f ${IMGPATH} ]]; then
 	agb_create_image
+fi
+
+if ${RUN_IMG}; then
 	agb_setup_virtual_machine
 	agb_start_image
 fi
 
-if ${CREATE_AMI}; then
+if ${UPLOAD_AMI}; then
 	create_iam_role
 	create_ami
 fi
