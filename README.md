@@ -1,5 +1,7 @@
 # AWS Gazo bot
 
+> *DISCLAIMER*: This is a work in progress, I'm trying to create OpenBSD images from Linux, specially using arm for AWS since OpenBSD has no vmm support for arm64 yet.
+
 Scripts to create, customize and upload AWS images to the cloud
 
 Based on the scripts created by Antoine Jacoutot at https://github.com/ajacoutot/aws-openbsd
